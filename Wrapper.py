@@ -69,8 +69,8 @@ def image2cam(u,v, focal_length):
     y_shifted= v - image_height/ 2
 
     dir_x = x_shifted / focal_length
-    dir_y = y_shifted / focal_length
-    dir_z = 1.0 #TODO check 1 or -1 
+    dir_y = -y_shifted / focal_length
+    dir_z = -1.0 
     dir = torch.tensor([dir_x, dir_y, dir_z])
 
     return dir
@@ -78,8 +78,12 @@ def image2cam(u,v, focal_length):
 def cam2world(cam_coords, extrinsic_matrix):
     # Convert camera coordinates to world coordinates (Extrinsic parameters)
     # TODO : Implement the conversion from camera coordinates to world coordinates using the extrinsic matrix
-    world_coords = torch.matmul(extrinsic_matrix, cam_coords)
-    return world_coords
+    rotation = extrinsic_matrix[:3, :3]
+    translation = extrinsic_matrix[:3, 3]
+
+    ray_o= translation
+    ray_d = torch.matmul(rotation, cam_coords)
+    return ray_o, ray_d
 
 
 def generate_batch(image, transform):
@@ -96,10 +100,10 @@ def generate_batch(image, transform):
     # sample rays for each pixel and get corresponding colors
     for r, c in zip(rows, cols):
         ray = image2cam(image[r, c], focal_length=1.0)  # Assuming focal length is 1.0 for simplicity
-        world_ray = cam2world(ray, transform)
-        rays.append(world_ray)
+        ray_o, ray_d = cam2world(ray, transform)
+        rays.append((ray_o, ray_d))
         colors.append(image[r, c])
-    return torch.stack(rays), torch.stack(colors)
+    return torch.stack([r[0] for r in rays]), torch.stack([r[1] for r in rays]), torch.stack(colors)
 
 def train(model, dataloader, optimizer, criterion):
     model.train()
