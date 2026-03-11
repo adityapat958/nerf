@@ -140,12 +140,12 @@ class NeRFModel(nn.Module):
 def volume_rendering(model, ray_o, ray_d, near, far):
     # Implement volume rendering to compute the final pixel color from the sampled points along the ray
     # TODO : Implement volume rendering using the NeRF model's output (e.g., using alpha compositing)
-    t = torch.linspace(near, far, steps=100).unsqueeze(0).unsqueeze(-1)  # Number of samples along each ray
-    ray_d_math = ray_d.unsqueeze(1)  # Expand ray_d to match the shape of t
-    ray_o_math = ray_o.unsqueeze(1)  # Expand ray_o to match the shape of t
+    t = torch.linspace(near, far, steps=100, device=device).unsqueeze(0).unsqueeze(-1) # Number of samples along each ray
+    ray_d_math = ray_d.unsqueeze(1) # Expand ray_d to match the shape of t
+    ray_o_math = ray_o.unsqueeze(1) # Expand ray_o to match the shape of t
     rays_t_math = ray_o_math + t * ray_d_math  # Sample points along the ray (assuming step size of 0.01)
 
-    ray_d_expanded= ray_d.unsqueeze(1).expand(-1, 100, -1)  # Expand ray_d to match the batch size
+    ray_d_expanded= ray_d.unsqueeze(1).expand(-1, 100, -1) # Expand ray_d to match the batch size
 
     rgb,sigma = model(rays_t_math, ray_d_expanded)  # Get RGB and density from the model
 
@@ -153,8 +153,8 @@ def volume_rendering(model, ray_o, ray_d, near, far):
     alpha = 1.0 - torch.exp(-sigma * 0.01)  # Assuming step size of 0.01
 
     # Compute weights for alpha compositing
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.0 - alpha + 1e-10], dim=1), dim=1)[:, :-1]
-
+    ones = torch.ones((alpha.shape[0], 1), device=device)
+    weights = alpha * torch.cumprod(torch.cat([ones, 1.0 - alpha + 1e-10], dim=1), dim=1)[:, :-1]
     # Compute final pixel color using alpha compositing
     pixel_color = torch.sum(weights.unsqueeze(-1) * rgb, dim=1)
 
@@ -167,22 +167,24 @@ def loss_function(predicted_color, true_color):
     mse_loss = torch.mean(error ** 2)
     return mse_loss
 
-def train(model, dataloader,nerfdata, val_dataset, optimizer,epochs,  near, far):
-
-    model.train()
+def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far):
+    best_val_loss = float('inf')
+    
     for epoch in range(epochs):
+        model.train()
+        total_train_loss = 0.0
         print(f"Epoch {epoch+1}/{epochs}")
-        for images, transforms in dataloader:
+        for images, transforms in train_dataloader:
             optimizer.zero_grad()
             images= images.squeeze(0) # remove batch dimension
             transforms = transforms.squeeze(0) # remove batch dimension
             num_of_pixels = images.shape[0] * images.shape[1]
 
-            batch_size = 100
+            batch_size = 2048
             indices = torch.randperm(num_of_pixels)[:batch_size]
 
             image_flatten= images.view(-1,3)
-            colors = image_flatten[indices]
+            colors = image_flatten[indices] # Get the true colors for the sampled pixels
 
             r, c = torch.unravel_index(indices, images.shape[:2])
 
@@ -190,35 +192,75 @@ def train(model, dataloader,nerfdata, val_dataset, optimizer,epochs,  near, far)
             ray = nerfdata.image2cam(u=c, v=r)  # Assuming focal length is 1.0 for simplicity
             ray_o, ray_d = nerfdata.cam2world(ray, transforms)
         
-
+            ray_o = ray_o.to(device)
+            ray_d = ray_d.to(device)
+            colors = colors.to(device)
             
             
             pixel_color = volume_rendering(model, ray_o, ray_d, near, far)
             loss = loss_function(pixel_color, colors)
             loss.backward()
             optimizer.step()
-        print(f"Epoch {epoch} Loss: {loss.item()}")
+            total_train_loss += loss.item()
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        
 
+        model.eval()
+        total_val_loss = 0.0
+
+        with torch.no_grad():
+            for val_images, val_transforms in val_dataloader:
+                val_images = val_images.squeeze(0)  # remove batch dimension
+                val_transforms = val_transforms.squeeze(0)  # remove batch dimension
+
+                val_indices = torch.randperm(val_images.shape[0] * val_images.shape[1])[:batch_size]
+                val_colors = val_images.view(-1, 3)[val_indices]
+                v_r, v_c = torch.unravel_index(val_indices, val_images.shape[:2])
+                
+                v_ray = nerfdata.image2cam(u=v_c, v=v_r)
+                v_ray_o, v_ray_d = nerfdata.cam2world(v_ray, val_transforms)
+                
+                v_ray_o = v_ray_o.to(device)
+                v_ray_d = v_ray_d.to(device)
+                val_colors = val_colors.to(device)
+                
+                v_pixel_color = volume_rendering(model, v_ray_o, v_ray_d, near, far)
+                v_loss = loss_function(v_pixel_color, val_colors)
+                total_val_loss += v_loss.item()
+                
+        avg_val_loss = total_val_loss / len(val_dataloader)
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            print(f"--> New best model found! Saving to best_nerf_model.pth")
+            torch.save(model.state_dict(), 'best_nerf_model.pth')
 
 if __name__ == "__main__":
-    # 1. Initialize your dataset and dataloader ONCE
-    nerf_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/chair/train', transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/chair/transforms_train.json')
-    val_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/chair/val', transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/chair/transforms_val.json')
-    nerf_dataloader = DataLoader(nerf_dataset, batch_size=1, shuffle=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on device: {device}")
+    # 1. Initialize Train Dataset and DataLoader
+    train_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/train', 
+                               transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/transforms_train.json')
+    train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-    # 2. Initialize your model and optimizer
-    nerf_model = NeRFModel()
-    # Adam is standard for NeRF, learning rate usually starts around 5e-4
+    # 2. Initialize Validation Dataset and DataLoader
+    val_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/val', 
+                             transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/transforms_val.json')
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Validation doesn't need to be shuffled
+
+    # 3. Initialize your model and optimizer
+    nerf_model = NeRFModel().to(device)
     optimizer = optim.Adam(nerf_model.parameters(), lr=5e-4) 
 
-    # 3. Start training!
+    # 4. Start training!
     train(
         model=nerf_model, 
-        dataloader=nerf_dataloader, 
-        nerfdata=nerf_dataset, # Pass the dataset so you can call image2cam
-        val_dataset=val_dataset, # Pass the validation dataset
+        train_dataloader=train_dataloader, 
+        val_dataloader=val_dataloader, # Pass the new validation dataloader
+        nerfdata=train_dataset, 
         optimizer=optimizer, 
-        epochs=100, 
-        near=2.0,  # NeRF Lego dataset bounds
-        far=6.0    # NeRF Lego dataset bounds
-    )       
+        epochs=1000,   # Bumped up epochs
+        near=2.0,  
+        far=6.0    
+    )
