@@ -12,6 +12,8 @@ import re
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+import imageio
+from skimage.metrics import structural_similarity
 
 class NerfDataset(Dataset):
     def __init__(self, data_dir, transform_path, transform=None, cache_images=True):
@@ -248,9 +250,41 @@ def env_flag(name, default=False):
         return default
     return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
-def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far, checkpoint_dir, start_epoch=0, rays_per_batch=4096, num_samples=100, val_interval=1):
+
+@torch.no_grad()
+def render_validation_preview(model, dataset, transform_matrix, near, far, chunk_size=32768, num_samples=100):
+    current_device = dataset.precomputed_cam_rays.device
+    transform_matrix = transform_matrix.to(current_device)
+    total_pixels = dataset.num_pixels
+    flat_indices = torch.arange(total_pixels, device=current_device)
+    rays_cam = dataset.get_camera_rays_from_flat_indices(flat_indices)
+    ray_o, ray_d = dataset.cam2world(rays_cam, transform_matrix)
+
+    all_colors = []
+    use_amp = torch.cuda.is_available()
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        for i in range(0, ray_o.shape[0], chunk_size):
+            chunk_ray_o = ray_o[i:i + chunk_size]
+            chunk_ray_d = ray_d[i:i + chunk_size]
+            chunk_color = volume_rendering(model, chunk_ray_o, chunk_ray_d, near, far, num_samples=num_samples)
+            all_colors.append(chunk_color)
+
+    img_flat = torch.cat(all_colors, dim=0)
+    return img_flat.view(dataset.image_height, dataset.image_width, 3)
+
+
+def compute_ssim(pred_img, gt_img):
+    pred_np = pred_img.detach().float().cpu().numpy()
+    gt_np = gt_img.detach().float().cpu().numpy()
+    pred_np = np.clip(pred_np, 0.0, 1.0)
+    gt_np = np.clip(gt_np, 0.0, 1.0)
+    return float(structural_similarity(gt_np, pred_np, channel_axis=2, data_range=1.0))
+
+def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, near, far, checkpoint_dir, val_dataset=None, start_epoch=0, rays_per_batch=4096, num_samples=100, val_interval=1, save_interval=10, render_interval=10, render_chunk_size=32768):
     best_val_loss = float('inf')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    preview_dir = os.path.join(checkpoint_dir, 'renders_every_interval')
+    os.makedirs(preview_dir, exist_ok=True)
     use_amp = torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
@@ -328,10 +362,38 @@ def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  n
             avg_val_loss = None
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val skipped")
 
-        if (epoch + 1) % 100 == 0:
+        if save_interval > 0 and (epoch + 1) % save_interval == 0:
             periodic_model_path = os.path.join(checkpoint_dir, f'nerf_model_epoch_{epoch+1:06d}.pth')
             print(f"--> Saving periodic checkpoint to {periodic_model_path}")
             torch.save(model.state_dict(), periodic_model_path)
+
+        if render_interval > 0 and val_dataset is not None and (epoch + 1) % render_interval == 0:
+            model_was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                gt_image_flat, preview_transform = val_dataset[0]
+                gt_image = gt_image_flat.view(val_dataset.image_height, val_dataset.image_width, 3)
+                preview_image = render_validation_preview(
+                    model=model,
+                    dataset=val_dataset,
+                    transform_matrix=preview_transform,
+                    near=near,
+                    far=far,
+                    chunk_size=render_chunk_size,
+                    num_samples=num_samples
+                )
+                gt_image = gt_image.to(preview_image.device)
+                preview_mse = torch.mean((preview_image - gt_image) ** 2).item()
+                preview_psnr = -10.0 * np.log10(max(preview_mse, 1e-12))
+                preview_ssim = compute_ssim(preview_image, gt_image)
+
+                preview_np = np.clip(preview_image.detach().cpu().numpy(), 0.0, 1.0)
+                preview_uint8 = (preview_np * 255.0).astype(np.uint8)
+                preview_path = os.path.join(preview_dir, f'epoch_{epoch+1:06d}.png')
+                imageio.imwrite(preview_path, preview_uint8)
+                print(f"--> Rendered preview @ epoch {epoch+1}: {preview_path} | PSNR: {preview_psnr:.2f}dB | SSIM: {preview_ssim:.4f}")
+            if model_was_training:
+                model.train()
 
         if avg_val_loss is not None and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -354,6 +416,9 @@ if __name__ == "__main__":
     parser.add_argument('--rays-per-batch', type=int, default=int(os.environ.get('NERF_RAYS_PER_BATCH', 4096)))
     parser.add_argument('--num-samples', type=int, default=int(os.environ.get('NERF_NUM_SAMPLES', 100)))
     parser.add_argument('--val-interval', type=int, default=int(os.environ.get('NERF_VAL_INTERVAL', 5)))
+    parser.add_argument('--save-interval', type=int, default=int(os.environ.get('NERF_SAVE_INTERVAL', 10)))
+    parser.add_argument('--render-interval', type=int, default=int(os.environ.get('NERF_RENDER_INTERVAL', 10)))
+    parser.add_argument('--render-chunk-size', type=int, default=int(os.environ.get('NERF_RENDER_CHUNK_SIZE', 32768)))
     parser.add_argument('--num-workers', type=int, default=int(os.environ.get('NERF_NUM_WORKERS', 4)))
     parser.add_argument('--cache-images', action='store_true', default=env_flag('NERF_CACHE_IMAGES', True))
     parser.add_argument('--no-cache-images', action='store_false', dest='cache_images')
@@ -443,8 +508,12 @@ if __name__ == "__main__":
         near=2.0,  
         far=6.0,
         checkpoint_dir=checkpoint_dir,
+        val_dataset=val_dataset,
         start_epoch=start_epoch,
         rays_per_batch=args.rays_per_batch,
         num_samples=args.num_samples,
-        val_interval=args.val_interval
+        val_interval=args.val_interval,
+        save_interval=args.save_interval,
+        render_interval=args.render_interval,
+        render_chunk_size=args.render_chunk_size
     )
