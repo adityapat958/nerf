@@ -1,5 +1,4 @@
 #write your own data loader, parser, network and loss function for this phase.
-from matplotlib import image
 
 import torch 
 import torch.nn as nn
@@ -8,10 +7,9 @@ import torch.optim as optim
 import numpy as np
 import json
 import os
+import argparse
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 from PIL import Image
-import matplotlib.pyplot as plt
 
 class NerfDataset(Dataset):
     def __init__(self, data_dir, transform_path, transform=None):
@@ -122,7 +120,7 @@ class NeRFModel(nn.Module):
         x = F.relu(self.fc1(rays_63))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        x = F.relu(torch.cat([rays_63, self.fc4(x)], dim=-1)) # skip connection, adds PE
+        x = torch.cat([rays_63, F.relu(self.fc4(x))], dim=-1) # skip connection, adds PE
         x = F.relu(self.fc5(x))
         x = F.relu(self.fc6(x))
         x = F.relu(self.fc7(x))
@@ -150,7 +148,8 @@ def volume_rendering(model, ray_o, ray_d, near, far):
     rgb,sigma = model(rays_t_math, ray_d_expanded)  # Get RGB and density from the model
 
     # Compute alpha values from density
-    alpha = 1.0 - torch.exp(-sigma * 0.01)  # Assuming step size of 0.01
+    step_size = (far - near) / 100
+    alpha = 1.0 - torch.exp(-sigma * step_size)
 
     # Compute weights for alpha compositing
     ones = torch.ones((alpha.shape[0], 1), device=device)
@@ -167,8 +166,9 @@ def loss_function(predicted_color, true_color):
     mse_loss = torch.mean(error ** 2)
     return mse_loss
 
-def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far):
+def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far, checkpoint_dir):
     best_val_loss = float('inf')
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     for epoch in range(epochs):
         model.train()
@@ -180,7 +180,7 @@ def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  n
             transforms = transforms.squeeze(0) # remove batch dimension
             num_of_pixels = images.shape[0] * images.shape[1]
 
-            batch_size = 2048
+            batch_size = 4096 
             indices = torch.randperm(num_of_pixels)[:batch_size]
 
             image_flatten= images.view(-1,3)
@@ -231,27 +231,57 @@ def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  n
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
 
+        if (epoch + 1) % 100 == 0:
+            periodic_model_path = os.path.join(checkpoint_dir, f'nerf_model_epoch_{epoch+1:06d}.pth')
+            print(f"--> Saving periodic checkpoint to {periodic_model_path}")
+            torch.save(model.state_dict(), periodic_model_path)
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            print(f"--> New best model found! Saving to best_nerf_model.pth")
-            torch.save(model.state_dict(), 'best_nerf_model.pth')
+            best_model_path = os.path.join(checkpoint_dir, 'best_nerf_model.pth')
+            print(f"--> New best model found! Saving to {best_model_path}")
+            torch.save(model.state_dict(), best_model_path)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Train NeRF on lego or ship scene')
+    parser.add_argument('--scene', choices=['ship', 'lego'], default=os.environ.get('NERF_SCENE', 'ship'))
+    parser.add_argument(
+        '--checkpoint-root',
+        default=os.environ.get(
+            'NERF_CKPT_DIR',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'checkpoints')
+        ),
+        help='Root directory for checkpoints (scene subfolder is appended automatically)'
+    )
+    args = parser.parse_args()
+
+    scene = args.scene
+
+    base_scene_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nerf_lego_ship', scene)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
+    print(f"Training scene: {scene}")
+
     # 1. Initialize Train Dataset and DataLoader
-    train_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/train', 
-                               transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/transforms_train.json')
+    train_dataset = NerfDataset(
+        data_dir=os.path.join(base_scene_dir, 'train'),
+        transform_path=os.path.join(base_scene_dir, 'transforms_train.json')
+    )
     train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
     # 2. Initialize Validation Dataset and DataLoader
-    val_dataset = NerfDataset(data_dir='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/val', 
-                             transform_path='/home/adipat/Documents/Spring_26/CV/p2/nerf/nerf_synthetic/lego/transforms_val.json')
+    val_dataset = NerfDataset(
+        data_dir=os.path.join(base_scene_dir, 'val'),
+        transform_path=os.path.join(base_scene_dir, 'transforms_val.json')
+    )
     val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Validation doesn't need to be shuffled
 
     # 3. Initialize your model and optimizer
     nerf_model = NeRFModel().to(device)
     optimizer = optim.Adam(nerf_model.parameters(), lr=5e-4) 
+    checkpoint_root = args.checkpoint_root
+    checkpoint_dir = os.path.join(checkpoint_root, scene)
 
     # 4. Start training!
     train(
@@ -260,7 +290,8 @@ if __name__ == "__main__":
         val_dataloader=val_dataloader, # Pass the new validation dataloader
         nerfdata=train_dataset, 
         optimizer=optimizer, 
-        epochs=1000,   # Bumped up epochs
+        epochs=100000,   # Bumped up epochs
         near=2.0,  
-        far=6.0    
+        far=6.0,
+        checkpoint_dir=checkpoint_dir
     )
