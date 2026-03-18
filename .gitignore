@@ -73,6 +73,8 @@ trial_dataset.h5
 
 # Logs
 *.log
+*.err
+*.out
 logs/
 runs/
 

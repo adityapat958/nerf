@@ -8,13 +8,16 @@ import numpy as np
 import json
 import os
 import argparse
+import re
+from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
 class NerfDataset(Dataset):
-    def __init__(self, data_dir, transform_path, transform=None):
+    def __init__(self, data_dir, transform_path, transform=None, cache_images=True):
         self.data_dir = data_dir
         self.transform_path = transform_path
+        self.cache_images = cache_images
         
         with open(self.transform_path, 'r') as f:
             transform_data = json.load(f)
@@ -30,7 +33,7 @@ class NerfDataset(Dataset):
         
         all_files = [f for f in os.listdir(data_dir) if f.endswith('.jpg') or f.endswith('.png')]
         self.image_paths = []
-        for f in all_files:
+        for f in sorted(all_files):
             
             basename = os.path.splitext(f)[0]
             if basename in self.transform_map:
@@ -40,11 +43,40 @@ class NerfDataset(Dataset):
         sample_image = Image.open(self.image_paths[0])
         self.image_width, self.image_height = sample_image.size
         self.focal_length = self.focal_length_from_fov(self.fov, self.image_width)
+        self.num_pixels = self.image_width * self.image_height
+
+        grid_u, grid_v = torch.meshgrid(
+            torch.arange(self.image_width, dtype=torch.float32),
+            torch.arange(self.image_height, dtype=torch.float32),
+            indexing='xy'
+        )
+        flat_u = grid_u.reshape(-1)
+        flat_v = grid_v.reshape(-1)
+        self.precomputed_cam_rays = self.image2cam(flat_u, flat_v).float().contiguous().to('cuda')  
+
+        self.cached_images = None
+        self.cached_transforms = None
+        if self.cache_images:
+            self.cached_images = []
+            self.cached_transforms = []
+            for img_path in tqdm(self.image_paths, desc=f"Caching {os.path.basename(data_dir)}", leave=False):
+                image = Image.open(img_path).convert('RGB')
+                basename = os.path.splitext(os.path.basename(img_path))[0]
+                transform = self.transform_map[basename]
+
+                image_tensor = torch.from_numpy(np.array(image) / 255.0).float().view(-1, 3).to('cuda')
+                transform_tensor = torch.tensor(transform, dtype=torch.float32).to('cuda')
+
+                self.cached_images.append(image_tensor)
+                self.cached_transforms.append(transform_tensor)
 
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
+        if self.cache_images and self.cached_images is not None:
+            return self.cached_images[idx], self.cached_transforms[idx]
+
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         
@@ -54,10 +86,14 @@ class NerfDataset(Dataset):
         # Instant O(1) lookup! No more for loops!
         transform = self.transform_map[basename]
         
-        image = torch.from_numpy(np.array(image) / 255.0).float() 
+        image = torch.from_numpy(np.array(image) / 255.0).float().to('cuda').view(-1, 3) 
         transform = torch.tensor(transform, dtype=torch.float32)
         
         return image, transform
+
+    def get_camera_rays_from_flat_indices(self, flat_indices):
+        
+        return self.precomputed_cam_rays[flat_indices].to('cuda')
     
     
     # Fov present in transform JSON in radians, key is "camera_angle_x"
@@ -91,68 +127,88 @@ class NerfDataset(Dataset):
         return ray_o, ray_d
         
 class NeRFModel(nn.Module):
-    def __init__(self):
+    def __init__(self, num_pts_freqs=10, num_view_freqs=4):
         super(NeRFModel, self).__init__()
-        # TODO : Define the architecture of the NeRF model (e.g., MLP with positional encoding)
-        self.fc1 = nn.Linear(63, 256)  # Input: ray direction (x, y, z)
+        
+        
+        self.register_buffer('pts_freqs', 2.0 ** torch.arange(num_pts_freqs))
+        self.register_buffer('view_freqs', 2.0 ** torch.arange(num_view_freqs))
+
+        self.fc1 = nn.Linear(63, 256)  
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 256)
         self.fc4 = nn.Linear(256, 256)
-        self.fc5 = nn.Linear(319, 256) # add skip connection here, add pose.
+        self.fc5 = nn.Linear(319, 256) 
         self.fc6 = nn.Linear(256, 256)
         self.fc7 = nn.Linear(256, 256)
         self.fc8 = nn.Linear(256, 257)
-        self.fc9 = nn.Linear(283, 256)# no relu , add 3D.
+        self.fc9 = nn.Linear(283, 256)
         self.fc10 = nn.Linear(256, 128)
-        self.fc11 = nn.Linear(128, 3)    # Output: RGB color
+        self.fc11 = nn.Linear(128, 3)    
 
-
-    def positional_encoding(self, x, num_freqs=10):
-        # TODO : Implement positional encoding for the input coordinates
-        pe = [x]
-        for i in range(num_freqs):
-            for fn in [torch.sin, torch.cos]:
-                pe.append(fn((2.0 ** i) * x))
-        return torch.cat(pe, dim=-1)
+    def positional_encoding(self, x, freqs):
+        # x  flattened
+        scaled = x.unsqueeze(-1) * freqs
+        scaled = scaled.flatten(start_dim=-2)
+        pe = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1)
+        return torch.cat([x, pe], dim=-1)
     
     def forward(self, pts, view_dir):
-        rays_63= self.positional_encoding(pts)  # Apply positional encoding to the input pts
+        batch_size, num_samples, _ = pts.shape
+        
+        
+        pts_flat = pts.reshape(-1, 3) 
+        
+        rays_63 = self.positional_encoding(pts_flat, self.pts_freqs)  
         x = F.relu(self.fc1(rays_63))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        x = torch.cat([rays_63, F.relu(self.fc4(x))], dim=-1) # skip connection, adds PE
+        x = torch.cat([rays_63, F.relu(self.fc4(x))], dim=-1) 
         x = F.relu(self.fc5(x))
         x = F.relu(self.fc6(x))
         x = F.relu(self.fc7(x))
         x = self.fc8(x)
-        sigma = F.relu(x[..., 0])  # Extract density value (first element of the output)
-        view_dir_20 = self.positional_encoding(view_dir, num_freqs=4)  # Apply positional encoding to the input view_dir
-        x = self.fc9((torch.cat([ x[..., 1:257], view_dir_20], dim=-1))) # skip connection, adds PE and 3D and density
-        x = F.relu(self.fc10(x))
         
-        output = torch.sigmoid(self.fc11(x))  # Output color in range [0, 1]
-        return output,sigma
+        sigma = F.relu(x[..., 0]) 
+        
+        # Expand view_dir, flatten, and encode
+        view_dir_expanded = view_dir.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 3)
+        view_dir_encoded = self.positional_encoding(view_dir_expanded, self.view_freqs) 
+        
+        x = self.fc9(torch.cat([x[..., 1:257], view_dir_encoded], dim=-1)) 
+        x = F.relu(self.fc10(x))
+        output = torch.sigmoid(self.fc11(x))  
+        
+        # Reshape back to 3D for volume rendering
+        sigma = sigma.view(batch_size, num_samples)
+        output = output.view(batch_size, num_samples, 3)
+        
+        return output, sigma
 
 
-
-def volume_rendering(model, ray_o, ray_d, near, far):
+def volume_rendering(model, ray_o, ray_d, near, far, num_samples=100):
     # Implement volume rendering to compute the final pixel color from the sampled points along the ray
     # TODO : Implement volume rendering using the NeRF model's output (e.g., using alpha compositing)
-    t = torch.linspace(near, far, steps=100, device=device).unsqueeze(0).unsqueeze(-1) # Number of samples along each ray
-    ray_d_math = ray_d.unsqueeze(1) # Expand ray_d to match the shape of t
-    ray_o_math = ray_o.unsqueeze(1) # Expand ray_o to match the shape of t
-    rays_t_math = ray_o_math + t * ray_d_math  # Sample points along the ray (assuming step size of 0.01)
+    current_device = ray_o.device
+    # t = torch.linspace(near, far, steps=num_samples, device=current_device) # Number of samples along each ray
+    # ray_d_math = ray_d.unsqueeze(1) # Expand ray_d to match the shape of t
+    # ray_o_math = ray_o.unsqueeze(1) # Expand ray_o to match the shape of t
+    # rays_t_math = ray_o_math + t * ray_d_math  # Sample points along the ray (assuming step size of 0.01)
 
-    ray_d_expanded= ray_d.unsqueeze(1).expand(-1, 100, -1) # Expand ray_d to match the batch size
+    
+    # ray_d_expanded= ray_d.unsqueeze(1).expand(-1, num_samples, -1) # Expand ray_d to match the batch size
+    t = torch.linspace(near, far, steps=num_samples, device=current_device)
+    rays_t_math = ray_o.unsqueeze(1) + t.view(1, -1, 1) * ray_d.unsqueeze(1)
 
-    rgb,sigma = model(rays_t_math, ray_d_expanded)  # Get RGB and density from the model
+    rgb,sigma = model(rays_t_math, ray_d)  # Get RGB and density from the model
 
     # Compute alpha values from density
-    step_size = (far - near) / 100
+    step_size = (far - near) / num_samples
     alpha = 1.0 - torch.exp(-sigma * step_size)
 
     # Compute weights for alpha compositing
-    ones = torch.ones((alpha.shape[0], 1), device=device)
+    transmittance = torch.cumprod(1.0 - alpha + 1e-10, dim=1)[:, :-1]
+    ones = torch.ones((alpha.shape[0], 1), device=current_device)
     weights = alpha * torch.cumprod(torch.cat([ones, 1.0 - alpha + 1e-10], dim=1), dim=1)[:, :-1]
     # Compute final pixel color using alpha compositing
     pixel_color = torch.sum(weights.unsqueeze(-1) * rgb, dim=1)
@@ -166,77 +222,118 @@ def loss_function(predicted_color, true_color):
     mse_loss = torch.mean(error ** 2)
     return mse_loss
 
-def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far, checkpoint_dir):
+def find_latest_epoch_checkpoint(checkpoint_dir):
+    if not os.path.isdir(checkpoint_dir):
+        return None, 0
+
+    pattern = re.compile(r"nerf_model_epoch_(\d{6})\.pth$")
+    latest_epoch = 0
+    latest_path = None
+
+    checkpoint_files = os.listdir(checkpoint_dir)
+    for filename in tqdm(checkpoint_files, desc="Scanning checkpoints", leave=False):
+        match = pattern.match(filename)
+        if not match:
+            continue
+        epoch_num = int(match.group(1))
+        if epoch_num > latest_epoch:
+            latest_epoch = epoch_num
+            latest_path = os.path.join(checkpoint_dir, filename)
+
+    return latest_path, latest_epoch
+
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  near, far, checkpoint_dir, start_epoch=0, rays_per_batch=4096, num_samples=100, val_interval=1):
     best_val_loss = float('inf')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         total_train_loss = 0.0
         print(f"Epoch {epoch+1}/{epochs}")
-        for images, transforms in train_dataloader:
-            optimizer.zero_grad()
+        train_progress = tqdm(train_dataloader, desc=f"Train {epoch+1}/{epochs}", leave=False)
+        for images, transforms in train_progress:
+            optimizer.zero_grad(set_to_none=True)
             images= images.squeeze(0) # remove batch dimension
             transforms = transforms.squeeze(0) # remove batch dimension
-            num_of_pixels = images.shape[0] * images.shape[1]
+            num_of_pixels = images.shape[0]
 
-            batch_size = 4096 
-            indices = torch.randperm(num_of_pixels)[:batch_size]
-
-            image_flatten= images.view(-1,3)
-            colors = image_flatten[indices] # Get the true colors for the sampled pixels
-
-            r, c = torch.unravel_index(indices, images.shape[:2])
-
+            batch_size = min(rays_per_batch, num_of_pixels)
             
-            ray = nerfdata.image2cam(u=c, v=r)  # Assuming focal length is 1.0 for simplicity
+            indices = torch.randint(0, num_of_pixels, (batch_size,))
+
+        
+            colors = images[indices] # Get the true colors for the sampled pixels
+
+            ray = nerfdata.get_camera_rays_from_flat_indices(indices)
             ray_o, ray_d = nerfdata.cam2world(ray, transforms)
         
-            ray_o = ray_o.to(device)
-            ray_d = ray_d.to(device)
-            colors = colors.to(device)
+            ray_o = ray_o
+            ray_d = ray_d
+            colors = colors
             
-            
-            pixel_color = volume_rendering(model, ray_o, ray_d, near, far)
-            loss = loss_function(pixel_color, colors)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast('cuda',enabled=use_amp):
+                pixel_color = volume_rendering(model, ray_o, ray_d, near, far, num_samples=num_samples)
+                loss = loss_function(pixel_color, colors)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_train_loss += loss.item()
+            train_progress.set_postfix(loss=f"{loss.item():.6f}")
         avg_train_loss = total_train_loss / len(train_dataloader)
         
+        run_validation = ((epoch + 1) % val_interval == 0)
+        if run_validation:
+            model.eval()
+            total_val_loss = 0.0
 
-        model.eval()
-        total_val_loss = 0.0
+            with torch.no_grad():
+                val_progress = tqdm(val_dataloader, desc=f"Val {epoch+1}/{epochs}", leave=False)
+                for val_images, val_transforms in val_progress:
+                    val_images = val_images.squeeze(0)  # remove batch dimension
+                    val_transforms = val_transforms.squeeze(0)  # remove batch dimension
+                    
+                    num_val_pixels = val_images.shape[0]
+                    val_indices = torch.randint(0, num_val_pixels, (batch_size,))
+                    val_colors = val_images[val_indices]
+                    
+                    
+                    v_ray = nerfdata.get_camera_rays_from_flat_indices(val_indices)
+                    v_ray_o, v_ray_d = nerfdata.cam2world(v_ray, val_transforms)
+                    
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        v_pixel_color = volume_rendering(model, v_ray_o, v_ray_d, near, far, num_samples=num_samples)
+                        v_loss = loss_function(v_pixel_color, val_colors)
+                    
+                    total_val_loss += v_loss.item()
+                    
+                    # Calculate PSNR for the progress bar
+                    v_psnr = -10.0 * torch.log10(v_loss).item()
+                    val_progress.set_postfix(loss=f"{v_loss.item():.6f}", psnr=f"{v_psnr:.2f}dB")
+                    
+            avg_val_loss = total_val_loss / len(val_dataloader)
+            avg_val_psnr = -10.0 * np.log10(avg_val_loss) # Overall validation PSNR
+            
+            print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val PSNR: {avg_val_psnr:.2f}dB")
 
-        with torch.no_grad():
-            for val_images, val_transforms in val_dataloader:
-                val_images = val_images.squeeze(0)  # remove batch dimension
-                val_transforms = val_transforms.squeeze(0)  # remove batch dimension
-
-                val_indices = torch.randperm(val_images.shape[0] * val_images.shape[1])[:batch_size]
-                val_colors = val_images.view(-1, 3)[val_indices]
-                v_r, v_c = torch.unravel_index(val_indices, val_images.shape[:2])
-                
-                v_ray = nerfdata.image2cam(u=v_c, v=v_r)
-                v_ray_o, v_ray_d = nerfdata.cam2world(v_ray, val_transforms)
-                
-                v_ray_o = v_ray_o.to(device)
-                v_ray_d = v_ray_d.to(device)
-                val_colors = val_colors.to(device)
-                
-                v_pixel_color = volume_rendering(model, v_ray_o, v_ray_d, near, far)
-                v_loss = loss_function(v_pixel_color, val_colors)
-                total_val_loss += v_loss.item()
-                
-        avg_val_loss = total_val_loss / len(val_dataloader)
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        else:
+            avg_val_loss = None
+            print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val skipped")
 
         if (epoch + 1) % 100 == 0:
             periodic_model_path = os.path.join(checkpoint_dir, f'nerf_model_epoch_{epoch+1:06d}.pth')
             print(f"--> Saving periodic checkpoint to {periodic_model_path}")
             torch.save(model.state_dict(), periodic_model_path)
 
-        if avg_val_loss < best_val_loss:
+        if avg_val_loss is not None and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_model_path = os.path.join(checkpoint_dir, 'best_nerf_model.pth')
             print(f"--> New best model found! Saving to {best_model_path}")
@@ -244,7 +341,7 @@ def train(model, train_dataloader,val_dataloader,nerfdata,  optimizer,epochs,  n
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train NeRF on lego or ship scene')
-    parser.add_argument('--scene', choices=['ship', 'lego'], default=os.environ.get('NERF_SCENE', 'ship'))
+    parser.add_argument('--scene', choices=['ship', 'lego', 'drone1', 'drone2'], default=os.environ.get('NERF_SCENE', 'ship'))
     parser.add_argument(
         '--checkpoint-root',
         default=os.environ.get(
@@ -253,6 +350,13 @@ if __name__ == "__main__":
         ),
         help='Root directory for checkpoints (scene subfolder is appended automatically)'
     )
+    parser.add_argument('--epochs', type=int, default=int(os.environ.get('NERF_EPOCHS', 100000)))
+    parser.add_argument('--rays-per-batch', type=int, default=int(os.environ.get('NERF_RAYS_PER_BATCH', 4096)))
+    parser.add_argument('--num-samples', type=int, default=int(os.environ.get('NERF_NUM_SAMPLES', 100)))
+    parser.add_argument('--val-interval', type=int, default=int(os.environ.get('NERF_VAL_INTERVAL', 5)))
+    parser.add_argument('--num-workers', type=int, default=int(os.environ.get('NERF_NUM_WORKERS', 4)))
+    parser.add_argument('--cache-images', action='store_true', default=env_flag('NERF_CACHE_IMAGES', True))
+    parser.add_argument('--no-cache-images', action='store_false', dest='cache_images')
     args = parser.parse_args()
 
     scene = args.scene
@@ -266,32 +370,81 @@ if __name__ == "__main__":
     # 1. Initialize Train Dataset and DataLoader
     train_dataset = NerfDataset(
         data_dir=os.path.join(base_scene_dir, 'train'),
-        transform_path=os.path.join(base_scene_dir, 'transforms_train.json')
+        transform_path=os.path.join(base_scene_dir, 'transforms_train.json'),
+        cache_images=args.cache_images
     )
-    train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    effective_num_workers = 0 if args.cache_images else args.num_workers
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=effective_num_workers,
+        pin_memory=(torch.cuda.is_available() and not args.cache_images),
+        persistent_workers=(effective_num_workers > 0)
+    )
 
     # 2. Initialize Validation Dataset and DataLoader
     val_dataset = NerfDataset(
         data_dir=os.path.join(base_scene_dir, 'val'),
-        transform_path=os.path.join(base_scene_dir, 'transforms_val.json')
+        transform_path=os.path.join(base_scene_dir, 'transforms_val.json'),
+        cache_images=args.cache_images
     )
-    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Validation doesn't need to be shuffled
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=effective_num_workers,
+        pin_memory=(torch.cuda.is_available() and not args.cache_images),
+        persistent_workers=(effective_num_workers > 0)
+    ) # Validation doesn't need to be shuffled
 
     # 3. Initialize your model and optimizer
     nerf_model = NeRFModel().to(device)
-    optimizer = optim.Adam(nerf_model.parameters(), lr=5e-4) 
+    
     checkpoint_root = args.checkpoint_root
     checkpoint_dir = os.path.join(checkpoint_root, scene)
+    start_epoch = 0
 
-    # 4. Start training!
+    # 4. Load Checkpoint BEFORE compiling
+    latest_ckpt_path, latest_epoch = find_latest_epoch_checkpoint(checkpoint_dir)
+    if latest_ckpt_path is not None:
+        print(f"Resuming from checkpoint: {latest_ckpt_path}")
+        with tqdm(total=1, desc="Loading checkpoint", leave=False) as pbar:
+            # Load the state dict
+            state_dict = torch.load(latest_ckpt_path, map_location=device)
+            
+            # Bulletproof fix: Strip the '_orig_mod.' prefix if it exists 
+            # This allows you to load both compiled and uncompiled checkpoints safely
+            clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            
+            # Load into the UNCOMPILED model
+            nerf_model.load_state_dict(clean_state_dict,strict=False)
+            pbar.update(1)
+            
+        start_epoch = latest_epoch
+        print(f"Resuming training from epoch {start_epoch + 1}")
+    else:
+        print(f"No periodic checkpoint found in {checkpoint_dir}. Starting from scratch.")
+
+    # 5. NOW compile the model 
+    nerf_model = torch.compile(nerf_model, mode="reduce-overhead")
+    
+    # 6. Initialize the optimizer AFTER compiling to ensure it tracks the right parameters
+    optimizer = optim.Adam(nerf_model.parameters(), lr=5e-4) 
+
+    # 7. Start training!
     train(
         model=nerf_model, 
         train_dataloader=train_dataloader, 
-        val_dataloader=val_dataloader, # Pass the new validation dataloader
+        val_dataloader=val_dataloader, 
         nerfdata=train_dataset, 
         optimizer=optimizer, 
-        epochs=100000,   # Bumped up epochs
+        epochs=args.epochs,
         near=2.0,  
         far=6.0,
-        checkpoint_dir=checkpoint_dir
+        checkpoint_dir=checkpoint_dir,
+        start_epoch=start_epoch,
+        rays_per_batch=args.rays_per_batch,
+        num_samples=args.num_samples,
+        val_interval=args.val_interval
     )
