@@ -13,7 +13,11 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import imageio
-from skimage.metrics import structural_similarity
+
+try:
+    from skimage.metrics import structural_similarity as skimage_structural_similarity
+except ImportError:
+    skimage_structural_similarity = None
 
 class NerfDataset(Dataset):
     def __init__(self, data_dir, transform_path, transform=None, cache_images=True):
@@ -129,22 +133,33 @@ class NerfDataset(Dataset):
         return ray_o, ray_d
         
 class NeRFModel(nn.Module):
-    def __init__(self, num_pts_freqs=10, num_view_freqs=4):
+    def __init__(self, num_pts_freqs=10, num_view_freqs=4, use_positional_encoding=True, zero_pe_features=False):
         super(NeRFModel, self).__init__()
-        
-        
-        self.register_buffer('pts_freqs', 2.0 ** torch.arange(num_pts_freqs))
-        self.register_buffer('view_freqs', 2.0 ** torch.arange(num_view_freqs))
+        self.use_positional_encoding = use_positional_encoding
+        self.zero_pe_features = zero_pe_features
+        self.num_pts_freqs = num_pts_freqs
+        self.num_view_freqs = num_view_freqs
 
-        self.fc1 = nn.Linear(63, 256)  
+        if self.use_positional_encoding:
+            self.register_buffer('pts_freqs', 2.0 ** torch.arange(num_pts_freqs))
+            self.register_buffer('view_freqs', 2.0 ** torch.arange(num_view_freqs))
+            point_input_dim = 3 + 3 * 2 * num_pts_freqs
+            view_input_dim = 3 + 3 * 2 * num_view_freqs
+        else:
+            self.register_buffer('pts_freqs', torch.empty(0))
+            self.register_buffer('view_freqs', torch.empty(0))
+            point_input_dim = 3
+            view_input_dim = 3
+
+        self.fc1 = nn.Linear(point_input_dim, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 256)
         self.fc4 = nn.Linear(256, 256)
-        self.fc5 = nn.Linear(319, 256) 
+        self.fc5 = nn.Linear(256 + point_input_dim, 256)
         self.fc6 = nn.Linear(256, 256)
         self.fc7 = nn.Linear(256, 256)
         self.fc8 = nn.Linear(256, 257)
-        self.fc9 = nn.Linear(283, 256)
+        self.fc9 = nn.Linear(256 + view_input_dim, 256)
         self.fc10 = nn.Linear(256, 128)
         self.fc11 = nn.Linear(128, 3)    
 
@@ -160,12 +175,18 @@ class NeRFModel(nn.Module):
         
         
         pts_flat = pts.reshape(-1, 3) 
-        
-        rays_63 = self.positional_encoding(pts_flat, self.pts_freqs)  
-        x = F.relu(self.fc1(rays_63))
+
+        if self.use_positional_encoding:
+            encoded_pts = self.positional_encoding(pts_flat, self.pts_freqs)
+            if self.zero_pe_features:
+                encoded_pts = torch.cat([encoded_pts[:, :3], torch.zeros_like(encoded_pts[:, 3:])], dim=-1)
+        else:
+            encoded_pts = pts_flat
+
+        x = F.relu(self.fc1(encoded_pts))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        x = torch.cat([rays_63, F.relu(self.fc4(x))], dim=-1) 
+        x = torch.cat([encoded_pts, F.relu(self.fc4(x))], dim=-1)
         x = F.relu(self.fc5(x))
         x = F.relu(self.fc6(x))
         x = F.relu(self.fc7(x))
@@ -175,7 +196,12 @@ class NeRFModel(nn.Module):
         
         # Expand view_dir, flatten, and encode
         view_dir_expanded = view_dir.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 3)
-        view_dir_encoded = self.positional_encoding(view_dir_expanded, self.view_freqs) 
+        if self.use_positional_encoding:
+            view_dir_encoded = self.positional_encoding(view_dir_expanded, self.view_freqs)
+            if self.zero_pe_features:
+                view_dir_encoded = torch.cat([view_dir_encoded[:, :3], torch.zeros_like(view_dir_encoded[:, 3:])], dim=-1)
+        else:
+            view_dir_encoded = view_dir_expanded
         
         x = self.fc9(torch.cat([x[..., 1:257], view_dir_encoded], dim=-1)) 
         x = F.relu(self.fc10(x))
@@ -274,11 +300,33 @@ def render_validation_preview(model, dataset, transform_matrix, near, far, chunk
 
 
 def compute_ssim(pred_img, gt_img):
-    pred_np = pred_img.detach().float().cpu().numpy()
-    gt_np = gt_img.detach().float().cpu().numpy()
-    pred_np = np.clip(pred_np, 0.0, 1.0)
-    gt_np = np.clip(gt_np, 0.0, 1.0)
-    return float(structural_similarity(gt_np, pred_np, channel_axis=2, data_range=1.0))
+    if skimage_structural_similarity is not None:
+        pred_np = pred_img.detach().float().cpu().numpy()
+        gt_np = gt_img.detach().float().cpu().numpy()
+        pred_np = np.clip(pred_np, 0.0, 1.0)
+        gt_np = np.clip(gt_np, 0.0, 1.0)
+        return float(skimage_structural_similarity(gt_np, pred_np, channel_axis=2, data_range=1.0))
+
+    pred = pred_img.detach().float().cpu().clamp(0.0, 1.0)
+    gt = gt_img.detach().float().cpu().clamp(0.0, 1.0)
+
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+
+    mu_pred = pred.mean(dim=(0, 1))
+    mu_gt = gt.mean(dim=(0, 1))
+
+    pred_centered = pred - mu_pred
+    gt_centered = gt - mu_gt
+
+    sigma_pred = (pred_centered ** 2).mean(dim=(0, 1))
+    sigma_gt = (gt_centered ** 2).mean(dim=(0, 1))
+    sigma_cross = (pred_centered * gt_centered).mean(dim=(0, 1))
+
+    numerator = (2 * mu_pred * mu_gt + c1) * (2 * sigma_cross + c2)
+    denominator = (mu_pred ** 2 + mu_gt ** 2 + c1) * (sigma_pred + sigma_gt + c2)
+    ssim_per_channel = numerator / (denominator + 1e-12)
+    return float(ssim_per_channel.mean().item())
 
 def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, near, far, checkpoint_dir, val_dataset=None, start_epoch=0, rays_per_batch=4096, num_samples=100, val_interval=1, save_interval=10, render_interval=10, render_chunk_size=32768):
     best_val_loss = float('inf')
@@ -320,6 +368,7 @@ def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             total_train_loss += loss.item()
             train_progress.set_postfix(loss=f"{loss.item():.6f}")
         avg_train_loss = total_train_loss / len(train_dataloader)
@@ -419,6 +468,8 @@ if __name__ == "__main__":
     parser.add_argument('--save-interval', type=int, default=int(os.environ.get('NERF_SAVE_INTERVAL', 10)))
     parser.add_argument('--render-interval', type=int, default=int(os.environ.get('NERF_RENDER_INTERVAL', 10)))
     parser.add_argument('--render-chunk-size', type=int, default=int(os.environ.get('NERF_RENDER_CHUNK_SIZE', 32768)))
+    parser.add_argument('--run-tag', default=os.environ.get('NERF_RUN_TAG', ''), help='Optional subfolder tag under scene for checkpoints')
+    parser.add_argument('--no-positional-encoding', action='store_true', help='Use model variant without positional encoding')
     parser.add_argument('--num-workers', type=int, default=int(os.environ.get('NERF_NUM_WORKERS', 4)))
     parser.add_argument('--cache-images', action='store_true', default=env_flag('NERF_CACHE_IMAGES', True))
     parser.add_argument('--no-cache-images', action='store_false', dest='cache_images')
@@ -431,6 +482,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     print(f"Training scene: {scene}")
+    print(f"Positional encoding: {not args.no_positional_encoding}")
 
     # 1. Initialize Train Dataset and DataLoader
     train_dataset = NerfDataset(
@@ -464,10 +516,10 @@ if __name__ == "__main__":
     ) # Validation doesn't need to be shuffled
 
     # 3. Initialize your model and optimizer
-    nerf_model = NeRFModel().to(device)
+    nerf_model = NeRFModel(use_positional_encoding=(not args.no_positional_encoding)).to(device)
     
     checkpoint_root = args.checkpoint_root
-    checkpoint_dir = os.path.join(checkpoint_root, scene)
+    checkpoint_dir = os.path.join(checkpoint_root, scene, args.run_tag) if args.run_tag else os.path.join(checkpoint_root, scene)
     start_epoch = 0
 
     # 4. Load Checkpoint BEFORE compiling
@@ -483,7 +535,11 @@ if __name__ == "__main__":
             clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
             
             # Load into the UNCOMPILED model
-            nerf_model.load_state_dict(clean_state_dict,strict=False)
+            try:
+                nerf_model.load_state_dict(clean_state_dict, strict=False)
+            except RuntimeError as exc:
+                print("Checkpoint/model architecture mismatch. Ensure positional-encoding mode and run-tag match the checkpoint.")
+                raise exc
             pbar.update(1)
             
         start_epoch = latest_epoch
@@ -496,6 +552,10 @@ if __name__ == "__main__":
     
     # 6. Initialize the optimizer AFTER compiling to ensure it tracks the right parameters
     optimizer = optim.Adam(nerf_model.parameters(), lr=5e-4) 
+
+    # Decays LR by a factor of 0.1 over the total number of epochs
+    gamma = (5e-5 / 5e-4) ** (1.0 / args.epochs)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
     # 7. Start training!
     train(
