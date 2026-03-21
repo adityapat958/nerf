@@ -173,8 +173,12 @@ class NeRFModel(nn.Module):
     def forward(self, pts, view_dir):
         batch_size, num_samples, _ = pts.shape
         
-        
-        pts_flat = pts.reshape(-1, 3) 
+        pts_flat = pts.reshape(-1, 3)
+
+        if not self.use_positional_encoding:
+            # Map coordinates roughly from [near, far] ≈ [2, 6] to [-1, 1]
+            # to keep inputs zero-centered and bounded for the non-PE model.
+            pts_flat = pts_flat/1.5
 
         if self.use_positional_encoding:
             encoded_pts = self.positional_encoding(pts_flat, self.pts_freqs)
@@ -191,9 +195,23 @@ class NeRFModel(nn.Module):
         x = F.relu(self.fc6(x))
         x = F.relu(self.fc7(x))
         x = self.fc8(x)
-        
-        sigma = F.relu(x[..., 0]) 
-        
+
+        # Density head: use a Softplus-based activation with optional
+        # noise during training for the non-PE model to avoid dead ReLUs
+        # and permanent "black void" collapse.
+        if self.use_positional_encoding:
+            sigma = F.relu(x[..., 0])
+        else:
+            sigma_pre = x[..., 0]
+            if self.training:
+                sigma_pre = sigma_pre + torch.randn_like(sigma_pre) * 1.0
+            sigma = F.softplus(sigma_pre)
+
+        # Normalize view directions so that non-PE models receive bounded
+        # inputs; PE already squashes values via sin/cos but normalization is
+        # harmless there as well.
+        view_dir = F.normalize(view_dir, p=2, dim=-1)
+
         # Expand view_dir, flatten, and encode
         view_dir_expanded = view_dir.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 3)
         if self.use_positional_encoding:
@@ -203,9 +221,9 @@ class NeRFModel(nn.Module):
         else:
             view_dir_encoded = view_dir_expanded
         
-        x = self.fc9(torch.cat([x[..., 1:257], view_dir_encoded], dim=-1)) 
+        x = self.fc9(torch.cat([x[..., 1:257], view_dir_encoded], dim=-1))
         x = F.relu(self.fc10(x))
-        output = torch.sigmoid(self.fc11(x))  
+        output = torch.sigmoid(self.fc11(x))
         
         # Reshape back to 3D for volume rendering
         sigma = sigma.view(batch_size, num_samples)
@@ -239,7 +257,15 @@ def volume_rendering(model, ray_o, ray_d, near, far, num_samples=100):
     ones = torch.ones((alpha.shape[0], 1), device=current_device)
     weights = alpha * torch.cumprod(torch.cat([ones, 1.0 - alpha + 1e-10], dim=1), dim=1)[:, :-1]
     # Compute final pixel color using alpha compositing
+    # Compute final pixel color using alpha compositing
     pixel_color = torch.sum(weights.unsqueeze(-1) * rgb, dim=1)
+    
+    # Calculate accumulated density along the ray
+    accumulated_alpha = torch.sum(weights, dim=1)
+    
+    # Composite onto a white background
+    white_bg = torch.ones_like(pixel_color)
+    pixel_color = pixel_color + (1.0 - accumulated_alpha.unsqueeze(-1)) * white_bg
 
     return pixel_color
 
@@ -287,7 +313,7 @@ def render_validation_preview(model, dataset, transform_matrix, near, far, chunk
     ray_o, ray_d = dataset.cam2world(rays_cam, transform_matrix)
 
     all_colors = []
-    use_amp = torch.cuda.is_available()
+    use_amp = torch.cuda.is_available() and getattr(model, 'use_positional_encoding', True)
     with torch.amp.autocast('cuda', enabled=use_amp):
         for i in range(0, ray_o.shape[0], chunk_size):
             chunk_ray_o = ray_o[i:i + chunk_size]
@@ -328,12 +354,12 @@ def compute_ssim(pred_img, gt_img):
     ssim_per_channel = numerator / (denominator + 1e-12)
     return float(ssim_per_channel.mean().item())
 
-def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, near, far, checkpoint_dir, val_dataset=None, start_epoch=0, rays_per_batch=4096, num_samples=100, val_interval=1, save_interval=10, render_interval=10, render_chunk_size=32768):
+def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, near, far, checkpoint_dir, val_dataset=None, start_epoch=0, rays_per_batch=8192, num_samples=64, val_interval=1, save_interval=10, render_interval=10, render_chunk_size=32768):
     best_val_loss = float('inf')
     os.makedirs(checkpoint_dir, exist_ok=True)
     preview_dir = os.path.join(checkpoint_dir, 'renders_every_interval')
     os.makedirs(preview_dir, exist_ok=True)
-    use_amp = torch.cuda.is_available()
+    use_amp = torch.cuda.is_available() and getattr(model, 'use_positional_encoding', True)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     for epoch in range(start_epoch, epochs):
@@ -368,10 +394,12 @@ def train(model, train_dataloader, val_dataloader, nerfdata, optimizer, epochs, 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            
             total_train_loss += loss.item()
             train_progress.set_postfix(loss=f"{loss.item():.6f}")
+        
         avg_train_loss = total_train_loss / len(train_dataloader)
+        scheduler.step()
         
         run_validation = ((epoch + 1) % val_interval == 0)
         if run_validation:
