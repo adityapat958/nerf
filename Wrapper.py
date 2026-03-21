@@ -66,11 +66,22 @@ class NerfDataset(Dataset):
             self.cached_images = []
             self.cached_transforms = []
             for img_path in tqdm(self.image_paths, desc=f"Caching {os.path.basename(data_dir)}", leave=False):
-                image = Image.open(img_path).convert('RGB')
+                image = Image.open(img_path).convert('RGBA')
+                image_np = np.array(image) / 255.0
+
+                # 2. Extract RGB and Alpha channels
+                rgb = image_np[..., :3]
+                alpha = image_np[..., 3:]
+
+                # 3. Composite ground truth against a pure white background
+                image_np = rgb * alpha + 1.0 * (1.0 - alpha)
+
+                # 4. Convert to tensor
+                image_tensor = torch.from_numpy(image_np).float().view(-1, 3).to('cuda')
                 basename = os.path.splitext(os.path.basename(img_path))[0]
                 transform = self.transform_map[basename]
 
-                image_tensor = torch.from_numpy(np.array(image) / 255.0).float().view(-1, 3).to('cuda')
+                # image_tensor = torch.from_numpy(np.array(image) / 255.0).float().view(-1, 3).to('cuda')
                 transform_tensor = torch.tensor(transform, dtype=torch.float32).to('cuda')
 
                 self.cached_images.append(image_tensor)
@@ -232,10 +243,11 @@ class NeRFModel(nn.Module):
         return output, sigma
 
 
-def volume_rendering(model, ray_o, ray_d, near, far, num_samples=100):
+def volume_rendering(model, ray_o, ray_d, near, far, num_samples=64):
     # Implement volume rendering to compute the final pixel color from the sampled points along the ray
     # TODO : Implement volume rendering using the NeRF model's output (e.g., using alpha compositing)
     current_device = ray_o.device
+    ray_d = F.normalize(ray_d, p=2, dim=-1)  # Ensure ray directions are normalized
     # t = torch.linspace(near, far, steps=num_samples, device=current_device) # Number of samples along each ray
     # ray_d_math = ray_d.unsqueeze(1) # Expand ray_d to match the shape of t
     # ray_o_math = ray_o.unsqueeze(1) # Expand ray_o to match the shape of t
