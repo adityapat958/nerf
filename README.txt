@@ -1,6 +1,24 @@
 This directory contains a dataset of synthetically rendered images that were used in "NeRF: Representing Scenes as
 Neural Radiance Fields for View Synthesis".
 
+Converting COLMAP Output to NeRF Format
+---------------------------------------
+Use `colmap_nerf_videos/convert_to_json.py` to convert COLMAP sparse reconstruction outputs into the NeRF dataset format.
+
+Usage:
+  python colmap_nerf_videos/convert_to_json.py --base_dir <colmap_project_dir> --output_dir <output_path>
+
+Arguments:
+  --base_dir     Directory containing sparse/ and frame folders (default: .)
+  --output_dir   Where to create the NeRF scene folders (default: ./generated_nerf_scenes)
+  --scene_suffix Suffix for output folder names (default: _copy)
+
+The script will:
+  - Read camera intrinsics from sparse/*/cameras.txt
+  - Read poses from sparse/*/images.txt
+  - Split images into train/val/test (every 10th frame to val, every 10+5th to test)
+  - Generate transforms_{train,val,test}.json files
+
 Stats:
 + 8 Scenes
 + 100 Training images
